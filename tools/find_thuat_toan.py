@@ -20,29 +20,86 @@ import argparse, base64, json, re, ssl, sys
 import urllib.request
 from urllib.parse import urljoin
 
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:159.0) Gecko/20100101 Firefox/159.0"}
+# Full browser-like headers — some servers (Next.js/Turbopack dev, WAFs) 404 requests
+# that lack Accept / Sec-Fetch-* / Referer. Referer+Origin are filled per-request.
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:159.0) Gecko/20100101 Firefox/159.0",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "identity",          # skip gzip so we don't need to decompress
+    "Sec-Fetch-Dest": "script",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Connection": "keep-alive",
+}
+EXTRA_HEADERS = {}   # populated from --header / --cookie
 _CTX = ssl.create_default_context(); _CTX.check_hostname = False; _CTX.verify_mode = ssl.CERT_NONE
+
+def _origin(url):
+    m = re.match(r"^(https?://[^/]+)", url)
+    return m.group(1) if m else url
 
 
 # ----------------------------------------------------------------- loading
 
+class FetchError(Exception):
+    pass
+
 def fetch(url):
-    return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=40, context=_CTX).read().decode("utf-8", "replace")
+    headers = dict(BASE_HEADERS)
+    headers["Referer"] = _origin(url) + "/"
+    headers["Origin"] = _origin(url)
+    headers.update(EXTRA_HEADERS)
+    try:
+        return urllib.request.urlopen(
+            urllib.request.Request(url, headers=headers), timeout=40, context=_CTX
+        ).read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise FetchError(f"HTTP {e.code} {e.reason}")
+    except urllib.error.URLError as e:
+        raise FetchError(f"cannot reach host ({e.reason})")
+    except Exception as e:  # timeout, ssl, decode, ...
+        raise FetchError(str(e))
+
+def _script_urls(html, base):
+    """Collect candidate .js URLs from an HTML page (handles Next.js/_next chunks)."""
+    found = re.findall(r'(?:src|href)="([^"]+\.js)"', html)
+    found += re.findall(r'"(/_next/static/[^"]+\.js)"', html)       # Next.js chunk refs
+    found += re.findall(r'["\'`](https?://[^"\'`]+\.js)["\'`]', html)
+    urls, seen = [], set()
+    for s in found:
+        u = s if s.startswith("http") else urljoin(base, s)
+        if u not in seen:
+            seen.add(u); urls.append(u)
+    return urls
 
 def load(target, crawl):
     if re.match(r"^https?://", target):
         body = fetch(target)
-        if crawl and ("<html" in body.lower() or "<script" in body.lower()):
-            srcs = re.findall(r'(?:src|href)="([^"]+\.js)"', body)
-            srcs = list(dict.fromkeys(srcs))
+        looks_html = re.match(r"\s*(?:<!doctype html|<html[\s>])", body, re.I) is not None
+        if crawl and looks_html:
+            urls = _script_urls(body, target)
+            if not urls:
+                raise FetchError("page has no <script src=...> / _next chunks to crawl")
             chunks, where = [], []
-            for s in srcs[:40]:
-                u = s if s.startswith("http") else urljoin(target, s)
+            for u in urls[:60]:
                 try:
                     chunks.append(fetch(u)); where.append(u)
-                except Exception as e:
-                    print(f"  [warn] could not fetch {u}: {e}", file=sys.stderr)
-            return "\n".join(chunks), where or [target]
+                except FetchError as e:
+                    print(f"  [warn] skip {u}: {e}", file=sys.stderr)
+            if not chunks:
+                raise FetchError("found script URLs but none could be fetched")
+            return "\n".join(chunks), where
+        if crawl and not looks_html:
+            print("  [info] --crawl given but target is already a script; scanning it directly.", file=sys.stderr)
+        # A .js URL that returns a tiny body (or an HTML doc) usually means the chunk
+        # hash changed (redeploy) and the server served an error / SPA fallback with 200.
+        if target.lower().split("?")[0].endswith(".js") and (looks_html or len(body) < 2000):
+            print(f"  [warn] '{target}' returned "
+                  + ("an HTML page" if looks_html else f"only {len(body)} chars")
+                  + " — likely a stale/renamed chunk or error page. "
+                    "Re-point at the app root with --crawl, or copy the current .js URL from DevTools.",
+                  file=sys.stderr)
         return body, [target]
     with open(target, "r", encoding="utf-8", errors="replace") as f:
         return f.read(), [target]
@@ -71,11 +128,24 @@ AES = {
     "AES-GCM": r'["\']AES-?GCM["\']|GCMParameterSpec|tagLength',
     "AES-CBC": r'["\']AES-?CBC["\']|CBC/PKCS|createCipheriv\(\s*["\']aes-\d+-cbc',
     "AES-CTR/ECB/OFB": r'["\']AES-?(CTR|ECB|OFB)["\']',
+    "CryptoJS AES (default CBC)": r'CryptoJS\.AES\.(?:en|de)crypt|CryptoJS\.mode\.',
     "IV length hint": r'new\s+Uint8Array\(\s*(\d{1,2})\s*\)|iv\s*[:=].{0,40}?(12|16)\b',
 }
 
 KEYGEN_EPHEMERAL = r'generateKeyPair|subtle\.generateKey|rsa\.generateKeyPair|KeyPairGenerator'
-KEYGEN_STATIC    = r'setPublicKey\(|publicKeyFromPem\(|setRsaPublicKey|importKey\('
+# importKey only counts as RSA-static when it imports an "spki" key (not raw AES/PBKDF2 keys)
+KEYGEN_STATIC    = r'setPublicKey\(|publicKeyFromPem\(|setRsaPublicKey|importKey\(\s*["\']spki["\']'
+
+# node-forge / jsencrypt internal API + type names — library noise, NOT app data fields.
+# Case-sensitive on purpose: excludes forge's "RSAPublicKey" but keeps an app's "rsaPublicKey".
+LIB_NOISE = frozenset({
+    "DSAPrivateKey", "ECPrivateKey", "EncryptedPrivateKey", "RSAPrivateKey", "RSAPublicKey",
+    "subjectPrivateKey", "subjectPublicKey", "ed25519PublicKey", "recoverPubKey",
+    "publicKeyToRSAPublicKey", "privateKeyToRSAPrivateKey", "encryptRsaPrivateKey",
+    "decryptRsaPrivateKey", "publicKeyFromPrivateKey", "getPrivateKey", "getPublicKey",
+    "setPrivateKey", "setPublicKey", "exportRSAPublicKey", "generateRSAKeyPair",
+    "publicKeyFromPem", "privateKeyFromPem", "setRsaPublicKey", "setRsaPrivateKey",
+})
 
 # identifiers that typically name exchanged key / session-key fields
 FIELD_HINTS = r'\b([A-Za-z_]\w*(?:[Pp]ub(?:lic)?[Kk]ey|[Pp]b[Kk]ey|[Ss]ym[Kk]ey|[Pp]riv(?:ate)?[Kk]ey|[Aa]uth[Tt]oken))\b'
@@ -190,9 +260,36 @@ def main():
     ap.add_argument("--crawl", action="store_true", help="treat URL as HTML and fetch its <script src> bundles")
     ap.add_argument("--context", type=int, default=140, help="chars of context per evidence snippet")
     ap.add_argument("--json", metavar="FILE", help="also write the profile as JSON")
+    ap.add_argument("--header", "-H", action="append", default=[], metavar='"K: V"',
+                    help="extra request header (repeatable), e.g. -H \"Referer: https://app/\"")
+    ap.add_argument("--cookie", metavar="STR", help="Cookie header value for authenticated chunks")
     a = ap.parse_args()
 
-    text, where = load(a.target, a.crawl)
+    for h in a.header:
+        if ":" in h:
+            k, v = h.split(":", 1); EXTRA_HEADERS[k.strip()] = v.strip()
+    if a.cookie:
+        EXTRA_HEADERS["Cookie"] = a.cookie
+
+    try:
+        text, where = load(a.target, a.crawl)
+    except FetchError as e:
+        print(f"[!] Could not load target: {e}\n", file=sys.stderr)
+        if re.match(r"^https?://", a.target):
+            print("    Hints:", file=sys.stderr)
+            print("      - Chunk hashes change every build (esp. Next.js /_next/static/chunks).", file=sys.stderr)
+            print("        Point at the app ROOT with --crawl to auto-discover current chunks:", file=sys.stderr)
+            base = re.match(r"^(https?://[^/]+)", a.target)
+            print(f"            python find_thuat_toan.py {base.group(1) if base else '<host>'}/ --crawl", file=sys.stderr)
+            print("      - Or copy the real .js URL from DevTools -> Network, or save it to a file", file=sys.stderr)
+            print("        and pass the local path instead.", file=sys.stderr)
+            print("      - Lazy-loaded chunks may not appear in the initial HTML; grab the specific", file=sys.stderr)
+            print("        crypto chunk from DevTools if --crawl misses it.", file=sys.stderr)
+        sys.exit(2)
+    except OSError as e:
+        print(f"[!] Cannot read file '{a.target}': {e}", file=sys.stderr)
+        sys.exit(2)
+
     print("=" * 72)
     print("find_thuat_toan — crypto recon")
     print("source :", ", ".join(where))
@@ -237,7 +334,7 @@ def main():
         print(f"    - {k['bits']}-bit  e={k['exponent']}  [{k['source']}]  {k['preview']}{warn}")
 
     print("\n[6] Field / endpoint hints")
-    fields = sorted(set(re.findall(FIELD_HINTS, text)))[:20]
+    fields = sorted(set(re.findall(FIELD_HINTS, text)) - LIB_NOISE)[:20]
     pwd = sorted(set(re.findall(PWD_HINTS, text, re.I)))[:10]
     trcodes = sorted(set(m[1] for m in re.findall(ENDPOINT_HINTS, text) if m[1]))[:15]
     print("    key/token fields :", ", ".join(fields) or "(none)")
