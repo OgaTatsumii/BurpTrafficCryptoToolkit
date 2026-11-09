@@ -1,0 +1,33 @@
+# Build output
+build/
+bin/
+out/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Gradle
+.gradle/
+gradle-app.setting
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+Thumbs.db
+
+# --- Operational secrets: NEVER commit these ---
+# Attacker keypairs, recovered session keys, captured material, target specifics
+*key*.json
+*key*.pem
+*.p12
+secrets.*
+target-*.properties
+local.config.*
+captures/
