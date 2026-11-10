@@ -233,23 +233,34 @@ def _add_key(keys, seen, b64, source, pos):
 
 def infer(text, libs, aes_hits, ephemeral, static, keys, pwd, fields):
     reasons = []
-    hybrid = bool(aes_hits and (ephemeral or any("SymKey" in f or "SymKey".lower() in f.lower() for f in fields)))
+    rsa_direct = any(("setPublicKey" in l) or ("jsencrypt" in l.lower()) for l in libs)
+    hybrid = bool(aes_hits and (ephemeral or any("symkey" in f.lower() for f in fields)))
+
     if hybrid:
         reasons.append("AES payload cipher + key-exchange/ephemeral keypair present")
-        scheme = "HYBRID_RSA_AES"
-    elif keys and static and not aes_hits:
-        reasons.append("hard-coded RSA public key + direct encrypt, no AES payload layer")
+        scheme = "DIRECT_RSA" if False else "HYBRID_RSA_AES"
+    elif (keys or rsa_direct) and pwd and not aes_hits:
+        reasons.append("RSA encrypt (setPublicKey/.encrypt) on a password field, no AES payload")
+        scheme = "DIRECT_RSA"
+    elif keys and static:
+        reasons.append("hard-coded RSA public key + direct encrypt")
         scheme = "DIRECT_RSA"
     elif pwd and keys:
-        reasons.append("password field + RSA public key, no AES")
+        reasons.append("password field + RSA public key")
         scheme = "DIRECT_RSA"
     else:
-        reasons.append("insufficient signal — review manually")
+        reasons.append("insufficient / ambiguous signal — review manually")
         scheme = "REVIEW"
 
+    # DIRECT_RSA with no decodable key => the public key is supplied at runtime.
+    dynamic_key = (scheme == "DIRECT_RSA" and not keys)
+    if dynamic_key:
+        reasons.append("public key not hard-coded here -> DYNAMIC (fetched/other chunk)")
+
     keygen = "EPHEMERAL (generated per session, exchanged)" if ephemeral else \
-             ("STATIC (hard-coded public key)" if (static or keys) else "UNKNOWN")
-    return scheme, keygen, reasons
+             ("STATIC (hard-coded public key)" if keys else
+              ("DYNAMIC (public key supplied at runtime)" if dynamic_key else "UNKNOWN"))
+    return scheme, keygen, reasons, dynamic_key
 
 
 # ----------------------------------------------------------------- report
@@ -341,13 +352,19 @@ def main():
     print("    password fields  :", ", ".join(pwd) or "(none)")
     print("    txn codes        :", ", ".join(trcodes) or "(none)")
 
-    scheme, keygen, reasons = infer(text, libs, aes_hits, ephemeral, static, keys, pwd, fields)
+    scheme, keygen, reasons, dynamic_key = infer(text, libs, aes_hits, ephemeral, static, keys, pwd, fields)
 
     print("\n" + "=" * 72)
     print("[=] VERDICT")
     print("    Scheme    :", scheme)
     print("    Key-gen   :", keygen)
     print("    Reasoning :", "; ".join(reasons))
+    if dynamic_key:
+        kf = next((f for f in fields if re.search(r"pub.?key", f, re.I)), None)
+        print("    [!] Public key is NOT in this file -> supplied at runtime"
+              + (f" (field '{kf}')" if kf else "")
+              + ". Find where it is delivered (an API response or another chunk)")
+        print("        and swap it THERE with Match & Replace (docs/05).")
     print("=" * 72)
 
     # Suggested template Config profile
